@@ -66,67 +66,31 @@ class GalleryEventHandler(PatternMatchingEventHandler):
         self.debounce_timer.start()
 
     def rescan_and_send_changes(self):
-        """Rescans, detects changes, sends updates, now thread-safe."""
+        """Rescans, detects changes, sends updates, thread-safe."""
         if self.running_scan:
             gallery_log("Another scan is running, skipping")
             return
 
-        self.running_scan = True  # Set the flag.
+        self.running_scan = True
+        try:
+            folder_name = os.path.basename(self.base_path)
+            new_folders_data, _ = _scan_for_images(self.base_path, folder_name, True, self.extensions, self.deduplicate_symlinks)
+            old_folders_data = self.last_known_folders
+            changes = detect_folder_changes(old_folders_data, new_folders_data)
 
-        def thread_target():
-            """Target function for the scanning thread."""
+            if changes and changes.get("folders"):
+                gallery_log("FileSystemMonitor: Changes detected after debounce, sending updates")
+                from .server import sanitize_json_data
+                PromptServer.instance.send_sync("Gallery.file_change", sanitize_json_data(changes))
+            else:
+                gallery_log("FileSystemMonitor: Changes detected by watchdog, but no relevant gallery changes after debounce.")
 
-            try:
-                folder_name = os.path.basename(self.base_path)
-                # Pass configured extensions to the scanner
-                new_folders_data, _ = _scan_for_images(self.base_path, folder_name, True, self.extensions, self.deduplicate_symlinks)
-                old_folders_data = self.last_known_folders
-                changes = detect_folder_changes(old_folders_data, new_folders_data)
-
-                # Put results and last_known_folders into the queue.
-                self.result_queue.put((changes, new_folders_data))
-
-
-            except Exception as e:
-                # Put any exception into the queue for the main thread to handle.
-                self.result_queue.put(e)
-
-
-        def on_scan_complete():
-            """Callback to run in the main thread after scanning."""
-            try:
-
-                result = self.result_queue.get()  # Use get - BLOCKING
-
-                if isinstance(result, Exception):
-                    gallery_log(f"FileSystemMonitor: Error during scan: {result}")
-                    return
-
-                changes, new_folders_data = result
-
-                if changes:
-                    gallery_log("FileSystemMonitor: Changes detected after debounce, sending updates")
-                    from .server import sanitize_json_data
-                    # Correctly schedule the send_sync call on the main thread.
-                    PromptServer.instance.send_sync("Gallery.file_change", sanitize_json_data(changes)) # NO ASYNCIO NEEDED
-                else:
-                    gallery_log("FileSystemMonitor: Changes detected by watchdog, but no relevant gallery changes after debounce.")
-
-                self.last_known_folders = new_folders_data  # Update last_known_folders.
-                self.debounce_timer = None
-            except queue.Empty:
-                gallery_log("FileSystemMonitor: Queue is empty, this shouldn't happen normally.")
-
-            finally:
-                self.running_scan = False #Clear flag in all cases
-
-        # Start the scan in a separate thread.
-        scan_thread = threading.Thread(target=thread_target)
-        scan_thread.start()
-
-        #Schedule the callback to be called when the scan is complete.
-        scan_thread.join() # Wait for the scan thread to actually complete!
-        on_scan_complete() # THEN call the completion function, now guaranteed to have data.
+            self.last_known_folders = new_folders_data
+            self.debounce_timer = None
+        except Exception as e:
+            gallery_log(f"FileSystemMonitor: Error during scan: {e}")
+        finally:
+            self.running_scan = False
 
 
 
